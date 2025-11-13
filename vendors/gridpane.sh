@@ -121,15 +121,17 @@ MakeSiteonRemote() {
 
 	if [ "$y" = "1" ]
 	then
-		echo "An error was detected during a previous function, skipping the remote site build step for this site..."
+		HandleError "Previous function error detected, skipping remote site build" "$site_to_clone" 0
 		return 1
 	fi
+
+	LogMessage "Starting remote site build for $site_to_clone on $remote_IP"
 
 	if ssh -n root@$remote_IP [ -d /var/www/$site_to_clone/htdocs/wp-content/plugins/nginx-helper ]
 	then
 		echo ""
 		echo "****************************************************************************"
-		echo "***** SITE ALREADY EXISTINGS ON REMOTE - PROCEDING WILL BE DESTRUCTIVE *****"
+		echo "***** SITE ALREADY EXISTS ON REMOTE - PROCEEDING WILL BE DESTRUCTIVE *****"
 		echo "****************************************************************************"
 		echo ""
 		echo "You must press Y (Case Sensitive) to Proceed"
@@ -139,6 +141,7 @@ MakeSiteonRemote() {
 		if [[ $REPLY =~ ^[Y]$ ]]
 		then
 		    echo "Proceeding with potentially destructive migration!!!"
+		    LogMessage "User confirmed overwrite of existing site $site_to_clone"
 			return 0
 		fi
 
@@ -152,6 +155,7 @@ MakeSiteonRemote() {
 		if [[ -d "/var/www/staging.$site_to_clone"  && -d "/var/www/canary.$site_to_clone" ]]
 		then
 
+			LogMessage "Building site with staging and canary: $site_to_clone"
 			echo "Site $site_to_clone has staging and updates, building three remote sites on $remote_IP..."
 
 			gpcurl=$(curl -d '{"server_ip":"'$remote_IP'", "source_ip":"'$remote_IP'", "url":"'$site_to_clone'", "checkedOptions":["wpfc","php7"], "checkedAdvancedOptions":["staging", "canary"]}' -H "Content-Type: application/json" -X POST https://my.gridpane.com/api/add-site?api_token=$gridpanetoken 2>&1)
@@ -160,6 +164,7 @@ MakeSiteonRemote() {
 		elif [ -d "/var/www/staging.$site_to_clone" ]
 		then
 
+			LogMessage "Building site with staging: $site_to_clone"
 			echo "Site $site_to_clone has a staging area, building two remote sites on $remote_IP..."
 
 			gpcurl=$(curl -d '{"server_ip":"'$remote_IP'", "source_ip":"'$remote_IP'", "url":"'$site_to_clone'", "checkedOptions":["wpfc","php7"], "checkedAdvancedOptions":["staging"]}' -H "Content-Type: application/json" -X POST https://my.gridpane.com/api/add-site?api_token=$gridpanetoken 2>&1)
@@ -167,24 +172,38 @@ MakeSiteonRemote() {
 		elif [ -d "/var/www/canary.$site_to_clone" ]
 		then
 
+			LogMessage "Building site with canary: $site_to_clone"
 			echo "Site $site_to_clone has automatic updates, building two remote sites on $remote_IP..."
 
 			gpcurl=$(curl -d '{"server_ip":"'$remote_IP'", "source_ip":"'$remote_IP'", "url":"'$site_to_clone'", "checkedOptions":["wpfc","php7"], "checkedAdvancedOptions":["canary"]}' -H "Content-Type: application/json" -X POST https://my.gridpane.com/api/add-site?api_token=$gridpanetoken 2>&1)
 
 		else
 
+			LogMessage "Building standard site: $site_to_clone"
 			echo "Site $site_to_clone has no staging or updates, building one remote site on $remote_IP..."
 
 			gpcurl=$(curl -d '{"server_ip":"'$remote_IP'",  "source_ip":"'$remote_IP'", "url":"'$site_to_clone'", "checkedOptions":["wpfc", "php7"]}' -H "Content-Type: application/json" -X POST https://my.gridpane.com/api/add-site?api_token=$gridpanetoken 2>&1)
 
 		fi
 	else
+		LogMessage "Building site with staging and canary: $site_to_clone"
 		echo "Building site $site_to_clone with staging and canary updates on remote GridPane server $remote_IP..."
 
 		gpcurl=$(curl -d '{"server_ip":"'$remote_IP'", "source_ip":"'$remote_IP'", "url":"'$site_to_clone'", "checkedOptions":["wpfc","php7"], "checkedAdvancedOptions":["staging", "canary"]}' -H "Content-Type: application/json" -X POST https://my.gridpane.com/api/add-site?api_token=$gridpanetoken 2>&1)
 	fi
 
-	echo "Waiting on remote server build..."
-	sleep 3
+	# Check API response for errors
+	if [[ $gpcurl == *"error"* ]] || [[ $gpcurl == *"Error"* ]]; then
+		HandleError "GridPane API error: $gpcurl" "$site_to_clone"
+		return 1
+	fi
+
+	LogMessage "GridPane API call successful, waiting for site provisioning..."
+
+	# Use the new polling function instead of fixed sleep
+	if ! WaitForRemoteSite "$remote_IP" "$site_to_clone" 300; then
+		HandleError "Remote site failed to provision within timeout" "$site_to_clone"
+		return 1
+	fi
 
 }

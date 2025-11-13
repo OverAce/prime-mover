@@ -39,6 +39,166 @@ ipaddress=$(curl http://ip4.ident.me 2>/dev/null)
 
 MigrateType=$1
 
+# Logging setup for better troubleshooting
+LOGFILE="/var/tmp/primemover/migration-$(date +%Y%m%d-%H%M%S).log"
+
+LogMessage() {
+	local message="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+	echo "$message" | tee -a "$LOGFILE"
+}
+
+# Validate GridPane API token
+ValidateGridPaneToken() {
+	if [[ $MigrateType == *"2GP"* ]] || [[ $MigrateType == "GP2GP" ]]; then
+		if [ -z "$gridpanetoken" ]; then
+			echo ""
+			echo "ERROR: GridPane API token is required for GridPane migrations!"
+			echo "Please enter your GridPane API token (found at https://my.gridpane.com/api):"
+			read -r gridpanetoken < /dev/tty
+
+			if [ -z "$gridpanetoken" ]; then
+				echo "ERROR: Cannot proceed without GridPane API token. Exiting..."
+				exit 1
+			fi
+
+			# Test the token with a simple API call
+			LogMessage "Testing GridPane API token..."
+			local test_result=$(curl -s -o /dev/null -w "%{http_code}" "https://my.gridpane.com/api/servers?api_token=$gridpanetoken")
+
+			if [ "$test_result" != "200" ]; then
+				echo "ERROR: GridPane API token appears to be invalid (HTTP $test_result)"
+				echo "Please verify your token at https://my.gridpane.com/api"
+				exit 1
+			fi
+
+			LogMessage "GridPane API token validated successfully"
+
+			# Save token to bash_profile for future use
+			if ! grep -q "export gridpanetoken=" ~/.bash_profile 2>/dev/null; then
+				echo "export gridpanetoken=\"$gridpanetoken\"" >> ~/.bash_profile
+				LogMessage "GridPane token saved to ~/.bash_profile"
+			fi
+		fi
+	fi
+}
+
+# Check available disk space before starting
+CheckDiskSpace() {
+	local path=$1
+	local required_gb=${2:-10}  # Default 10GB minimum
+
+	LogMessage "Checking disk space at $path..."
+
+	local available_kb=$(df "$path" | tail -1 | awk '{print $4}')
+	local available_gb=$((available_kb / 1024 / 1024))
+
+	if [ "$available_gb" -lt "$required_gb" ]; then
+		echo ""
+		echo "WARNING: Low disk space detected!"
+		echo "Available: ${available_gb}GB"
+		echo "Recommended minimum: ${required_gb}GB"
+		echo ""
+		echo "Site packaging creates temporary archives that can be very large."
+		echo "Do you want to continue anyway? (yes/no)"
+		read -r continue_anyway < /dev/tty
+
+		if [[ ! "$continue_anyway" =~ ^[Yy][Ee][Ss]$ ]]; then
+			echo "Migration cancelled due to insufficient disk space."
+			exit 1
+		fi
+	else
+		LogMessage "Disk space OK: ${available_gb}GB available"
+	fi
+}
+
+# Improved error handling with detailed messages
+HandleError() {
+	local error_message=$1
+	local site_name=${2:-"unknown"}
+	local exit_code=${3:-1}
+
+	LogMessage "ERROR: $error_message (Site: $site_name)"
+	echo ""
+	echo "=========================================="
+	echo "ERROR OCCURRED"
+	echo "=========================================="
+	echo "Site: $site_name"
+	echo "Error: $error_message"
+	echo "Check log file: $LOGFILE"
+	echo "=========================================="
+	echo ""
+
+	# Set global error flag
+	y=1
+
+	if [ "$exit_code" -eq 1 ]; then
+		return 1
+	fi
+}
+
+# Poll for remote site readiness instead of fixed sleep
+WaitForRemoteSite() {
+	local remote_ip=$1
+	local site_domain=$2
+	local max_wait=${3:-300}  # Default 5 minutes
+	local elapsed=0
+
+	LogMessage "Waiting for remote site $site_domain to be ready..."
+
+	while [ $elapsed -lt $max_wait ]; do
+		if ssh -n root@$remote_ip "[ -d /var/www/$site_domain/htdocs/wp-content/plugins/nginx-helper ]" 2>/dev/null; then
+			LogMessage "Remote site is ready after ${elapsed} seconds"
+			return 0
+		fi
+
+		sleep 5
+		elapsed=$((elapsed + 5))
+
+		if [ $((elapsed % 30)) -eq 0 ]; then
+			echo "Still waiting for remote site... (${elapsed}s elapsed)"
+		fi
+	done
+
+	HandleError "Timeout waiting for remote site to provision" "$site_domain"
+	return 1
+}
+
+# Verify site after migration
+VerifySiteMigration() {
+	local remote_ip=$1
+	local site_domain=$2
+
+	LogMessage "Verifying migration for $site_domain..."
+
+	# Check if WordPress is installed
+	local wp_check=$(ssh -n root@$remote_ip "cd /var/www/$site_domain/htdocs && wp core is-installed --allow-root 2>&1" 2>&1)
+
+	if [[ $wp_check == *"Error"* ]]; then
+		HandleError "WordPress verification failed on remote site" "$site_domain" 0
+		return 1
+	fi
+
+	# Check if database is accessible
+	local db_check=$(ssh -n root@$remote_ip "cd /var/www/$site_domain/htdocs && wp db check --allow-root 2>&1" 2>&1)
+
+	if [[ $db_check == *"Error"* ]] || [[ $db_check == *"error"* ]]; then
+		HandleError "Database verification failed on remote site" "$site_domain" 0
+		return 1
+	fi
+
+	# Get site URL to confirm
+	local site_url=$(ssh -n root@$remote_ip "cd /var/www/$site_domain/htdocs && wp option get siteurl --allow-root 2>&1" 2>&1)
+
+	LogMessage "Migration verified successfully! Site URL: $site_url"
+	echo ""
+	echo "✓ Migration verified successfully!"
+	echo "  Site: $site_domain"
+	echo "  URL: $site_url"
+	echo ""
+
+	return 0
+}
+
 MeImCounting() {
 	
 	echo "This is all very VERY aplha right now. Use at your own risk."
@@ -246,33 +406,53 @@ StartDomainLogging() {
 
 
 DBExport() {
-	
+
 	if [ "$y" = "1" ]
 	then
-		echo "An error was detected during a previous function, skipping the site packaging step for this site..."
+		HandleError "Previous function error detected, skipping database export" "${site_to_clone:-${appname}}" 0
 		return 1
 	fi
-	
+
+	LogMessage "Exporting database for ${site_to_clone:-${appname}}..."
 	echo "Exporting Database..."
+
 	export=$(wp db export database.sql --allow-root 2>&1)
-	
-	if [[ $export == *"PHP Parse error"* ]]
+	export_status=$?
+
+	if [[ $export == *"PHP Parse error"* ]] || [ $export_status -ne 0 ]
 	then
+		LogMessage "WP-CLI export failed, attempting manual mysqldump..."
 		echo "We have a config problem and WP-CLI can't run - attempting manual mysqldump..."
+
 		WPDBNAME=`cat wp-config.php | grep DB_NAME | cut -d \' -f 4`
 		WPDBUSER=`cat wp-config.php | grep DB_USER | cut -d \' -f 4`
 		WPDBPASS=`cat wp-config.php | grep DB_PASSWORD | cut -d \' -f 4`
-		mysqldump -u$WPDBUSER -p$WPDBPASS $WPDBNAME > database.sql
-		
+
+		if [ -z "$WPDBNAME" ] || [ -z "$WPDBUSER" ]; then
+			HandleError "Cannot extract database credentials from wp-config.php" "${site_to_clone:-${appname}}"
+			return 1
+		fi
+
+		mysqldump -u$WPDBUSER -p$WPDBPASS $WPDBNAME > database.sql 2>&1
+		mysqldump_status=$?
+
+		if [ $mysqldump_status -ne 0 ]; then
+			HandleError "mysqldump failed with exit code $mysqldump_status" "${site_to_clone:-${appname}}"
+			return 1
+		fi
+
 	else
-		echo "Automated DB export appear to throw any errors, double checking..."
+		LogMessage "WP-CLI database export completed successfully"
+		echo "Automated DB export completed successfully..."
 	fi
-	
-	if [ -f database.sql ]
+
+	if [ -f database.sql ] && [ -s database.sql ]
 	then
-		echo "DB Exported successfully..."
+		local db_size=$(du -h database.sql | cut -f1)
+		LogMessage "Database exported successfully (Size: $db_size)"
+		echo "DB Exported successfully... (Size: $db_size)"
 	else
-		echo "Database failed to export through either method... this site will fail!!!"
+		HandleError "Database file missing or empty after export" "${site_to_clone:-${appname}}"
 		return 1
 	fi
 
