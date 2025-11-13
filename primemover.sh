@@ -9,9 +9,12 @@
 # Easily move WordPress sites between two different servers managed by GridPane, ServerPilot, RunCloud and Others...
 
 # You'll need to already have manually built your sites at RunCloud and have WordPress successfully running there BEFORE trying to move sites in from other sources.
-# ServerPilot site build code (via API) is already built but needs to be reintegrated to this work. 
+# ServerPilot site build code (via API) is already built but needs to be reintegrated to this work.
 
-source ~/.bash_profile
+# Safely source bash_profile if it exists
+if [ -f ~/.bash_profile ]; then
+    source ~/.bash_profile
+fi
 
 if [[ $EUID -ne 0 ]]; then
    echo "This script must be run as root, exiting!!!" 
@@ -31,7 +34,7 @@ ipaddress=$(curl http://ip4.ident.me 2>/dev/null)
 MigrateType=$1
 
 MeImCounting() {
-	
+
 	echo "This is all very VERY aplha right now. Use at your own risk."
 	echo " "
 	echo "All kinds of things might be broken. It's a work in progress and we'll get it hammered out shortly."
@@ -46,6 +49,165 @@ MeImCounting() {
 
 }
 MeImCounting
+
+# Logging setup for better troubleshooting
+LOGFILE="/var/tmp/primemover/migration-$(date +%Y%m%d-%H%M%S).log"
+LogMessage() {
+	local message="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+	echo "$message" | tee -a "$LOGFILE"
+}
+
+# Validate GridPane API token
+ValidateGridPaneToken() {
+	if [[ $MigrateType == *"2GP"* ]] || [[ $MigrateType == "GP2GP" ]]; then
+		if [ -z "$gridpanetoken" ]; then
+			echo ""
+			echo "ERROR: GridPane API token is required for GridPane migrations!"
+			echo "Please enter your GridPane API token (found at https://my.gridpane.com/api):"
+			read -r gridpanetoken < /dev/tty
+
+			if [ -z "$gridpanetoken" ]; then
+				echo "ERROR: Cannot proceed without GridPane API token. Exiting..."
+				exit 1
+			fi
+
+			# Test the token with a simple API call
+			LogMessage "Testing GridPane API token..."
+			local test_result=$(curl -s -o /dev/null -w "%{http_code}" "https://my.gridpane.com/api/servers?api_token=$gridpanetoken")
+
+			if [ "$test_result" != "200" ]; then
+				echo "ERROR: GridPane API token appears to be invalid (HTTP $test_result)"
+				echo "Please verify your token at https://my.gridpane.com/api"
+				exit 1
+			fi
+
+			LogMessage "GridPane API token validated successfully"
+
+			# Save token to bash_profile for future use
+			if ! grep -q "export gridpanetoken=" ~/.bash_profile 2>/dev/null; then
+				echo "export gridpanetoken=\"$gridpanetoken\"" >> ~/.bash_profile
+				LogMessage "GridPane token saved to ~/.bash_profile"
+			fi
+		fi
+	fi
+}
+
+# Check available disk space before starting
+CheckDiskSpace() {
+	local path=$1
+	local required_gb=${2:-10}  # Default 10GB minimum
+
+	LogMessage "Checking disk space at $path..."
+
+	local available_kb=$(df "$path" | tail -1 | awk '{print $4}')
+	local available_gb=$((available_kb / 1024 / 1024))
+
+	if [ "$available_gb" -lt "$required_gb" ]; then
+		echo ""
+		echo "WARNING: Low disk space detected!"
+		echo "Available: ${available_gb}GB"
+		echo "Recommended minimum: ${required_gb}GB"
+		echo ""
+		echo "Site packaging creates temporary archives that can be very large."
+		echo "Do you want to continue anyway? (yes/no)"
+		read -r continue_anyway < /dev/tty
+
+		if [[ ! "$continue_anyway" =~ ^[Yy][Ee][Ss]$ ]]; then
+			echo "Migration cancelled due to insufficient disk space."
+			exit 1
+		fi
+	else
+		LogMessage "Disk space OK: ${available_gb}GB available"
+	fi
+}
+
+# Improved error handling with detailed messages
+HandleError() {
+	local error_message=$1
+	local site_name=${2:-"unknown"}
+	local exit_code=${3:-1}
+
+	LogMessage "ERROR: $error_message (Site: $site_name)"
+	echo ""
+	echo "=========================================="
+	echo "ERROR OCCURRED"
+	echo "=========================================="
+	echo "Site: $site_name"
+	echo "Error: $error_message"
+	echo "Check log file: $LOGFILE"
+	echo "=========================================="
+	echo ""
+
+	# Set global error flag
+	y=1
+
+	if [ "$exit_code" -eq 1 ]; then
+		return 1
+	fi
+}
+
+# Poll for remote site readiness instead of fixed sleep
+WaitForRemoteSite() {
+	local remote_ip=$1
+	local site_domain=$2
+	local max_wait=${3:-300}  # Default 5 minutes
+	local elapsed=0
+
+	LogMessage "Waiting for remote site $site_domain to be ready..."
+
+	while [ $elapsed -lt $max_wait ]; do
+		if ssh -n root@$remote_ip "[ -d /var/www/$site_domain/htdocs/wp-content/plugins/nginx-helper ]" 2>/dev/null; then
+			LogMessage "Remote site is ready after ${elapsed} seconds"
+			return 0
+		fi
+
+		sleep 5
+		elapsed=$((elapsed + 5))
+
+		if [ $((elapsed % 30)) -eq 0 ]; then
+			echo "Still waiting for remote site... (${elapsed}s elapsed)"
+		fi
+	done
+
+	HandleError "Timeout waiting for remote site to provision" "$site_domain"
+	return 1
+}
+
+# Verify site after migration
+VerifySiteMigration() {
+	local remote_ip=$1
+	local site_domain=$2
+
+	LogMessage "Verifying migration for $site_domain..."
+
+	# Check if WordPress is installed
+	local wp_check=$(ssh -n root@$remote_ip "cd /var/www/$site_domain/htdocs && wp core is-installed --allow-root 2>&1" 2>&1)
+
+	if [[ $wp_check == *"Error"* ]]; then
+		HandleError "WordPress verification failed on remote site" "$site_domain" 0
+		return 1
+	fi
+
+	# Check if database is accessible
+	local db_check=$(ssh -n root@$remote_ip "cd /var/www/$site_domain/htdocs && wp db check --allow-root 2>&1" 2>&1)
+
+	if [[ $db_check == *"Error"* ]] || [[ $db_check == *"error"* ]]; then
+		HandleError "Database verification failed on remote site" "$site_domain" 0
+		return 1
+	fi
+
+	# Get site URL to confirm
+	local site_url=$(ssh -n root@$remote_ip "cd /var/www/$site_domain/htdocs && wp option get siteurl --allow-root 2>&1" 2>&1)
+
+	LogMessage "Migration verified successfully! Site URL: $site_url"
+	echo ""
+	echo "✓ Migration verified successfully!"
+	echo "  Site: $site_domain"
+	echo "  URL: $site_url"
+	echo ""
+
+	return 0
+}
 
 CommandVariablesCheck() {
 	
@@ -1075,36 +1237,39 @@ sort -k5 -n /var/tmp/primemover.domains.tmp > /var/tmp/primemover.domains.tmp2
 
 }
 
-# Build required site(s) on remote GridPane server 
+# Build required site(s) on remote GridPane server
 # Currently works only with GridPane... cool your jets, I'm working on it.
 
 MakeSiteonRemote() {
-	
+
 	if [ "$y" = "1" ]
 	then
-		echo "An error was detected during a previous function, skipping the remote site build step for this site..."
+		HandleError "Previous function error detected, skipping remote site build" "$site_to_clone" 0
 		return 1
 	fi
-	
-	if ssh -n root@$remote_IP [ -d /var/www/$site_to_clone/htdocs/wp-content/plugins/nginx-helper ] 
+
+	LogMessage "Starting remote site build for $site_to_clone on $remote_IP"
+
+	if ssh -n root@$remote_IP [ -d /var/www/$site_to_clone/htdocs/wp-content/plugins/nginx-helper ]
 	then
 		echo ""
 		echo "****************************************************************************"
-		echo "***** SITE ALREADY EXISTINGS ON REMOTE - PROCEDING WILL BE DESTRUCTIVE *****"
+		echo "***** SITE ALREADY EXISTS ON REMOTE - PROCEEDING WILL BE DESTRUCTIVE *****"
 		echo "****************************************************************************"
 		echo ""
-		echo "You must press Y (Case Sensitive) to Proceed"		
+		echo "You must press Y (Case Sensitive) to Proceed"
 		echo "Otherwise in ten seconds this site migration will be automatically halted..."
 		read -t 10 -n 1 -s -r -p "Press Y to continue, anything else will halt this migration!" < /dev/tty
-		
+
 		if [[ $REPLY =~ ^[Y]$ ]]
 		then
 		    echo "Proceeding with potentially destructive migration!!!"
+		    LogMessage "User confirmed overwrite of existing site $site_to_clone"
 			return 0
 		fi
-		
+
 		exit 187;
-		
+
 	fi
 
 	if [ $envir == "GP" ]
@@ -1112,72 +1277,108 @@ MakeSiteonRemote() {
 		echo "Checking for staging and canary sites..."
 		if [[ -d "/var/www/staging.$site_to_clone"  && -d "/var/www/canary.$site_to_clone" ]]
 		then
-		
+
+			LogMessage "Building site with staging and canary: $site_to_clone"
 			echo "Site $site_to_clone has staging and updates, building three remote sites on $remote_IP..."
-		
+
 			gpcurl=$(curl -d '{"server_ip":"'$remote_IP'", "source_ip":"'$remote_IP'", "url":"'$site_to_clone'", "checkedOptions":["wpfc","php7"], "checkedAdvancedOptions":["staging", "canary"]}' -H "Content-Type: application/json" -X POST https://my.gridpane.com/api/add-site?api_token=$gridpanetoken 2>&1)
-			
-	
+
+
 		elif [ -d "/var/www/staging.$site_to_clone" ]
 		then
-		
+
+			LogMessage "Building site with staging: $site_to_clone"
 			echo "Site $site_to_clone has a staging area, building two remote sites on $remote_IP..."
-		
+
 			gpcurl=$(curl -d '{"server_ip":"'$remote_IP'", "source_ip":"'$remote_IP'", "url":"'$site_to_clone'", "checkedOptions":["wpfc","php7"], "checkedAdvancedOptions":["staging"]}' -H "Content-Type: application/json" -X POST https://my.gridpane.com/api/add-site?api_token=$gridpanetoken 2>&1)
-			
+
 		elif [ -d "/var/www/canary.$site_to_clone" ]
 		then
-		
+
+			LogMessage "Building site with canary: $site_to_clone"
 			echo "Site $site_to_clone has automatic updates, building two remote sites on $remote_IP..."
-		
+
 			gpcurl=$(curl -d '{"server_ip":"'$remote_IP'", "source_ip":"'$remote_IP'", "url":"'$site_to_clone'", "checkedOptions":["wpfc","php7"], "checkedAdvancedOptions":["canary"]}' -H "Content-Type: application/json" -X POST https://my.gridpane.com/api/add-site?api_token=$gridpanetoken 2>&1)
-			
+
 		else
-		
+
+			LogMessage "Building standard site: $site_to_clone"
 			echo "Site $site_to_clone has no staging or updates, building one remote site on $remote_IP..."
-		
+
 			gpcurl=$(curl -d '{"server_ip":"'$remote_IP'",  "source_ip":"'$remote_IP'", "url":"'$site_to_clone'", "checkedOptions":["wpfc", "php7"]}' -H "Content-Type: application/json" -X POST https://my.gridpane.com/api/add-site?api_token=$gridpanetoken 2>&1)
-			
+
 		fi
 	else
+		LogMessage "Building site with staging and canary: $site_to_clone"
 		echo "Building site $site_to_clone with staging and canary updates on remote GridPane server $remote_IP..."
-		
+
 		gpcurl=$(curl -d '{"server_ip":"'$remote_IP'", "source_ip":"'$remote_IP'", "url":"'$site_to_clone'", "checkedOptions":["wpfc","php7"], "checkedAdvancedOptions":["staging", "canary"]}' -H "Content-Type: application/json" -X POST https://my.gridpane.com/api/add-site?api_token=$gridpanetoken 2>&1)
 	fi
-	
-	echo "Waiting on remote server build..."
-	sleep 3
+
+	# Check API response for errors
+	if [[ $gpcurl == *"error"* ]] || [[ $gpcurl == *"Error"* ]]; then
+		HandleError "GridPane API error: $gpcurl" "$site_to_clone"
+		return 1
+	fi
+
+	LogMessage "GridPane API call successful, waiting for site provisioning..."
+
+	# Use the new polling function instead of fixed sleep
+	if ! WaitForRemoteSite "$remote_IP" "$site_to_clone" 300; then
+		HandleError "Remote site failed to provision within timeout" "$site_to_clone"
+		return 1
+	fi
 
 }
 
 DBExport() {
-	
+
 	if [ "$y" = "1" ]
 	then
-		echo "An error was detected during a previous function, skipping the site packaging step for this site..."
+		HandleError "Previous function error detected, skipping database export" "${site_to_clone:-${appname}}" 0
 		return 1
 	fi
-	
+
+	LogMessage "Exporting database for ${site_to_clone:-${appname}}..."
 	echo "Exporting Database..."
+
 	export=$(wp db export database.sql --allow-root 2>&1)
-	
-	if [[ $export == *"PHP Parse error"* ]]
+	export_status=$?
+
+	if [[ $export == *"PHP Parse error"* ]] || [ $export_status -ne 0 ]
 	then
+		LogMessage "WP-CLI export failed, attempting manual mysqldump..."
 		echo "We have a config problem and WP-CLI can't run - attempting manual mysqldump..."
+
 		WPDBNAME=`cat wp-config.php | grep DB_NAME | cut -d \' -f 4`
 		WPDBUSER=`cat wp-config.php | grep DB_USER | cut -d \' -f 4`
 		WPDBPASS=`cat wp-config.php | grep DB_PASSWORD | cut -d \' -f 4`
-		mysqldump -u$WPDBUSER -p$WPDBPASS $WPDBNAME > database.sql
-		
+
+		if [ -z "$WPDBNAME" ] || [ -z "$WPDBUSER" ]; then
+			HandleError "Cannot extract database credentials from wp-config.php" "${site_to_clone:-${appname}}"
+			return 1
+		fi
+
+		mysqldump -u$WPDBUSER -p$WPDBPASS $WPDBNAME > database.sql 2>&1
+		mysqldump_status=$?
+
+		if [ $mysqldump_status -ne 0 ]; then
+			HandleError "mysqldump failed with exit code $mysqldump_status" "${site_to_clone:-${appname}}"
+			return 1
+		fi
+
 	else
-		echo "Automated DB export appear to throw any errors, double checking..."
+		LogMessage "WP-CLI database export completed successfully"
+		echo "Automated DB export completed successfully..."
 	fi
-	
-	if [ -f database.sql ]
+
+	if [ -f database.sql ] && [ -s database.sql ]
 	then
-		echo "DB Exported successfully..."
+		local db_size=$(du -h database.sql | cut -f1)
+		LogMessage "Database exported successfully (Size: $db_size)"
+		echo "DB Exported successfully... (Size: $db_size)"
 	else
-		echo "Database failed to export through either method... this site will fail!!!"
+		HandleError "Database file missing or empty after export" "${site_to_clone:-${appname}}"
 		return 1
 	fi
 
@@ -1187,19 +1388,24 @@ DBExport() {
 # Compress and package current site for secure copying
 
 PackageSite() {
-	
+
 	if [ "$y" = "1" ]
 	then
-		echo "An error was detected during a previous function, skipping the site packaging step for this site..."
+		HandleError "Previous function error detected, skipping site packaging" "${site_to_clone:-${appname}}" 0
 		return 1
 	fi
-	
+
+	LogMessage "Starting site packaging for ${site_to_clone:-${appname}}..."
+
 	if [ $envir == "RC" ]
 	then
 		echo "Packaging local RunCloud powered site $appname for user $username..."
 
 		cd /home/$username/webapps/$appname
 		echo "Arrived at directory... $PWD"
+
+		# Check disk space before starting
+		CheckDiskSpace "/home/$username" 10
 
 		DBExport
 		
@@ -1233,41 +1439,67 @@ PackageSite() {
 
 	elif [ $envir == "SP" ]
 	then
-		echo "Packaging local ServerPilot powered site $appname for user $D..."
-		
+		echo "Packaging local ServerPilot powered site $appname for user $username..."
+
 		# Get to the choppa...
 		cd /srv/users/$username/apps/$appname/public
 		echo "Arrived at directory... $PWD"
-		
+
+		# Check disk space before starting
+		CheckDiskSpace "/srv/users/$username" 10
+
 		DBExport
-		
+
 		if [ "$y" = "1" ]
 		then
-			echo "An error was detected during a previous function, skipping the site packaging step for this site..."
+			HandleError "Database export failed, cannot continue packaging" "$appname" 0
 			return 1
 		fi
-		
-		#Need to get the DB prefix from wp-config... 
+
+		#Need to get the DB prefix from wp-config...
 		tableprefix=$(sed -n -e '/$table_prefix/p' wp-config.php)
 		echo $tableprefix > table.prefix
 		chmod 400 table.prefix
+		LogMessage "Database table prefix exported"
 		echo "Database Table Prefix Exported..."
 
 		cp wp-config.php wp-config.last.config
 		chmod 400 wp-config.last.config
 
-		#tar -czf /srv/users/$username/apps/$appname/primemover-$appname-migration-file.gz . --exclude '*.zip' --exclude '*.gz' --exclude 'wp-config.php'
-		
-		tar -cf - . -P --exclude '*.zip' --exclude '*.gz' --exclude 'wp-config.php' | pv -s $(du -sb . | awk '{print $1}') | gzip > /srv/users/$username/apps/$appname/primemover-$appname-migration-file.gz
+		LogMessage "Creating tar.gz archive for $appname..."
+		echo "Creating site archive (this may take a while for large sites)..."
 
-		echo "Cleaning up..."
+		#tar -czf /srv/users/$username/apps/$appname/primemover-$appname-migration-file.gz . --exclude '*.zip' --exclude '*.gz' --exclude 'wp-config.php'
+
+		tar -cf - . -P --exclude '*.zip' --exclude '*.gz' --exclude 'wp-config.php' | pv -s $(du -sb . | awk '{print $1}') | gzip > /srv/users/$username/apps/$appname/primemover-$appname-migration-file.gz
+		tar_status=$?
+
+		if [ $tar_status -ne 0 ]; then
+			HandleError "tar creation failed with exit code $tar_status" "$appname"
+			rm -f database.sql table.prefix wp-config.last.config
+			return 1
+		fi
+
+		sitepack="/srv/users/$username/apps/$appname/primemover-$appname-migration-file.gz"
+
+		# Verify the archive was created and is not empty
+		if [ ! -f "$sitepack" ] || [ ! -s "$sitepack" ]; then
+			HandleError "Site archive is missing or empty" "$appname"
+			rm -f database.sql table.prefix wp-config.last.config
+			return 1
+		fi
+
+		local pack_size=$(du -h "$sitepack" | cut -f1)
+		LogMessage "Site archive created successfully (Size: $pack_size)"
+		echo "Site archive created: $pack_size"
+
+		echo "Cleaning up temporary files..."
 		rm database.sql
 		rm table.prefix
 		rm wp-config.last.config
-		
+
+		LogMessage "Site $appname has been successfully packaged"
 		echo "Site $appname has been successfully packed up..."
-		
-		sitepack="/srv/users/$username/apps/$appname/primemover-$appname-migration-file.gz"
 		
 	elif [ $envir == "CP" ]
 	then
@@ -1489,37 +1721,74 @@ PushToRC() {
 # All of this is only going to work moving things into a GridPane server...
 
 DoMigrate() {
-	
+
 	if [ "$y" = "1" ]
 	then
-		echo "An error was detected during a previous function, skipping the migration step for this site..."
+		HandleError "Previous function error detected, skipping migration" "$site_to_clone" 0
 		return 1
 	fi
-	
-	echo "Waiting for remote site to completely provision..."
-	
-	while ssh -n root@$remote_IP [ ! -d /var/www/$site_to_clone/htdocs/wp-content/plugins/nginx-helper ]
-	do
-	  sleep 5
-	done
-	
+
+	LogMessage "Starting migration for $site_to_clone to $remote_IP"
+	echo "Transferring site to remote server..."
+
+	# Use polling function instead of while loop
+	if ! WaitForRemoteSite "$remote_IP" "$site_to_clone" 300; then
+		HandleError "Remote site not ready for migration" "$site_to_clone"
+		return 1
+	fi
+
+	# Get file size for progress reporting
+	local pack_size=$(du -h "$sitepack" | cut -f1)
+	LogMessage "Transferring $pack_size to remote server..."
+	echo "Transferring $pack_size to $remote_IP..."
+
 	scp $sitepack root@$remote_IP:/var/www/$site_to_clone/GPBUP-$site_to_clone-CLONE.gz
-	
-	if [[ $y -gt 0 ]]
+	scp_status=$?
+
+	if [ $scp_status -ne 0 ]
 	then
-		echo "The secure copy to the remote server failed for site $site_to_clone! Exiting..."
+		HandleError "Secure copy failed with exit code $scp_status" "$site_to_clone"
 		return 1
 	else
+		LogMessage "Site pack transferred successfully to $remote_IP"
 		echo "Successfully copied site pack for $site_to_clone to remote system $remote_IP"
 		rm $sitepack
 	fi
-	
+
+	LogMessage "Executing remote restoration for $site_to_clone..."
+	echo "Restoring site on remote server (this may take a while)..."
+
 	ssh -n root@$remote_IP "sleep 1 && cd /var/www/$site_to_clone/htdocs && gprestore" < /dev/null
-	
+	restore_status=$?
+
+	if [ $restore_status -ne 0 ]; then
+		HandleError "Remote restoration failed with exit code $restore_status" "$site_to_clone"
+		return 1
+	fi
+
+	LogMessage "Remote restoration completed for $site_to_clone"
 	echo "Site $site_to_clone restored on remote system $remote_IP"
 
+	# Verify the migration was successful
+	echo "Verifying migration..."
+	if VerifySiteMigration "$remote_IP" "$site_to_clone"; then
+		LogMessage "Migration completed and verified successfully for $site_to_clone"
+		echo ""
+		echo "=========================================="
+		echo "✓ MIGRATION SUCCESSFUL"
+		echo "=========================================="
+		echo "Site: $site_to_clone"
+		echo "Remote IP: $remote_IP"
+		echo "=========================================="
+		echo ""
+	else
+		echo ""
+		echo "WARNING: Migration completed but verification had issues."
+		echo "Please manually verify the site at $site_to_clone"
+		echo ""
+	fi
+
 	echo "Cleaning up..."
-	
 	sleep 1
 
 }
@@ -1734,22 +2003,88 @@ LoopLocalSites() {
 }
 
 SPtoGP() {
-	
+
+	LogMessage "Starting ServerPilot to GridPane migration"
+
+	# Validate GridPane API token before starting
+	ValidateGridPaneToken
+
+	# Check disk space on source server
+	CheckDiskSpace "/srv/users" 15
+
+	# Get remote GridPane server IP
+	echo ""
+	echo "Please enter the IP address of your target GridPane server:"
+	read -r remote_IP < /dev/tty
+
+	if [ -z "$remote_IP" ]; then
+		echo "ERROR: Remote IP address is required. Exiting..."
+		exit 1
+	fi
+
+	LogMessage "Target GridPane server: $remote_IP"
+
+	# Setup SSH connection
+	DoSSH "$remote_IP"
+
+	# Get all ServerPilot domains
 	spDomains
-	
+
 	$site_to_clone="ALL"
-	
+
 	DoWork
+
+	# Print summary
+	echo ""
+	echo "=========================================="
+	echo "MIGRATION BATCH COMPLETED"
+	echo "=========================================="
+	echo "Check log file for details: $LOGFILE"
+	echo "=========================================="
+	echo ""
 
 }
 
 RCtoGP() {
-	
+
+	LogMessage "Starting RunCloud to GridPane migration"
+
+	# Validate GridPane API token before starting
+	ValidateGridPaneToken
+
+	# Check disk space on source server
+	CheckDiskSpace "/home" 15
+
+	# Get remote GridPane server IP
+	echo ""
+	echo "Please enter the IP address of your target GridPane server:"
+	read -r remote_IP < /dev/tty
+
+	if [ -z "$remote_IP" ]; then
+		echo "ERROR: Remote IP address is required. Exiting..."
+		exit 1
+	fi
+
+	LogMessage "Target GridPane server: $remote_IP"
+
+	# Setup SSH connection
+	DoSSH "$remote_IP"
+
+	# Get all RunCloud domains
 	rcDomains
-	
+
 	$site_to_clone="ALL"
-	
+
 	DoWork
+
+	# Print summary
+	echo ""
+	echo "=========================================="
+	echo "MIGRATION BATCH COMPLETED"
+	echo "=========================================="
+	echo "Check log file for details: $LOGFILE"
+	echo "=========================================="
+	echo ""
 
 }
 
