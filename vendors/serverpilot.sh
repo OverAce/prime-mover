@@ -459,11 +459,44 @@ sort -k5 -n /var/tmp/primemover.domains.tmp > /var/tmp/primemover.domains.tmp2
 
 SPtoGP() {
 
+	LogMessage "Starting ServerPilot to GridPane migration"
+
+	# Validate GridPane API token before starting
+	ValidateGridPaneToken
+
+	# Check disk space on source server
+	CheckDiskSpace "/srv/users" 15
+
+	# Get remote GridPane server IP
+	echo ""
+	echo "Please enter the IP address of your target GridPane server:"
+	read -r remote_IP < /dev/tty
+
+	if [ -z "$remote_IP" ]; then
+		echo "ERROR: Remote IP address is required. Exiting..."
+		exit 1
+	fi
+
+	LogMessage "Target GridPane server: $remote_IP"
+
+	# Setup SSH connection
+	DoSSH "$remote_IP"
+
+	# Get all ServerPilot domains
 	spDomains
 
 	$site_to_clone="ALL"
 
 	DoWork
+
+	# Print summary
+	echo ""
+	echo "=========================================="
+	echo "MIGRATION BATCH COMPLETED"
+	echo "=========================================="
+	echo "Check log file for details: $LOGFILE"
+	echo "=========================================="
+	echo ""
 
 }
 

@@ -1,8 +1,26 @@
-# Prime Mover (PrimeMover.io) 
+# Prime Mover (PrimeMover.io)
+
+# RECENT IMPROVEMENTS (v1.1)
+
+**ServerPilot to GridPane migrations have been significantly enhanced for production use!**
+
+Major improvements include:
+- ✓ GridPane API token validation
+- ✓ Pre-flight disk space checking
+- ✓ Post-migration verification
+- ✓ Comprehensive logging
+- ✓ Intelligent polling (no more fixed sleeps)
+- ✓ Better error handling and reporting
+
+See [IMPROVEMENTS.md](IMPROVEMENTS.md) for complete details.
 
 # CAUTION!!!
 
-This is all VERY alpha right now. This isn't anything inherently "destructive" about this script other than the fact that it can theoretically fill your hard drive up in the process of making tar/gz clones of all of your sites. 
+This is ALPHA software. While recent improvements have made ServerPilot → GridPane migrations much more reliable, you should still:
+- Test with non-critical sites first
+- Verify disk space before starting
+- Review logs after migration
+- Have backups available
 
 *Use at your own risk!*
 
