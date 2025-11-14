@@ -11,7 +11,9 @@
 # You'll need to already have manually built your sites at RunCloud and have WordPress successfully running there BEFORE trying to move sites in from other sources.
 # ServerPilot site build code (via API) is already built but needs to be reintegrated to this work. 
 
-source ~/.bash_profile
+if [ -f ~/.bash_profile ]; then
+    source ~/.bash_profile
+fi
 
 if [[ $EUID -ne 0 ]]; then
    echo "This script must be run as root, exiting!!!" 
@@ -201,7 +203,7 @@ VerifySiteMigration() {
 
 MeImCounting() {
 	
-	echo "This is all very VERY aplha right now. Use at your own risk."
+	echo "This is all very VERY alpha right now. Use at your own risk."
 	echo " "
 	echo "All kinds of things might be broken. It's a work in progress and we'll get it hammered out shortly."
 	echo " "
@@ -508,7 +510,7 @@ PackageSite() {
 
 	elif [ $envir == "SP" ]
 	then
-		echo "Packaging local ServerPilot powered site $appname for user $D..."
+		echo "Packaging local ServerPilot powered site $appname for user $username..."
 		
 		# Get to the choppa...
 		cd /srv/users/$username/apps/$appname/public
