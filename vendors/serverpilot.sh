@@ -485,7 +485,7 @@ SPtoGP() {
 	# Get all ServerPilot domains
 	spDomains
 
-	$site_to_clone="ALL"
+	site_to_clone="ALL"
 
 	DoWork
 

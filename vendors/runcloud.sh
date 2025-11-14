@@ -56,15 +56,15 @@ RCtoSP() {
 
 			if [ -f "/etc/php56rc/fpm.d/$appname.conf" ]
 			then
-				echo "PHP56RC file found... setting PHP to verison 5.6"
+				echo "PHP56RC file found... setting PHP to version 5.6"
 				php="php5.6"
 			elif [ -f "/etc/php70rc/fpm.d/$appname.conf" ]
 			then
-				echo "PHP70RC file found... setting PHP to verison 7.0"
+				echo "PHP70RC file found... setting PHP to version 7.0"
 				php="php7.0"
 			elif [ -f "/etc/php71rc/fpm.d/$appname.conf" ]
 			then
-				echo "PHP71RC file found... setting PHP to verison 7.1"
+				echo "PHP71RC file found... setting PHP to version 7.1"
 				php="php7.1"
 			else
 				echo "No PHP file found... defaulting to PHP7.0"
@@ -320,7 +320,7 @@ RCtoGP() {
 	# Get all RunCloud domains
 	rcDomains
 
-	$site_to_clone="ALL"
+	site_to_clone="ALL"
 
 	DoWork
 
